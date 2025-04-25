@@ -1,0 +1,443 @@
+# ---------------------------------
+# Step 1: Import Libraries
+# ---------------------------------
+import os
+import gdown
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import seaborn as sns
+from sklearn.model_selection import train_test_split, StratifiedKFold
+from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score, roc_auc_score, confusion_matrix
+from sklearn.preprocessing import StandardScaler
+from sklearn.impute import SimpleImputer
+from imblearn.over_sampling import SMOTE
+import torch
+import torch.nn as nn
+from torch.utils.data import DataLoader, TensorDataset
+from torch.optim.lr_scheduler import ReduceLROnPlateau
+from scipy.stats import mode, chi2_contingency
+import statsmodels.stats.contingency_tables as ct
+
+# ---------------------------------
+# Step 2: Download HRS Data
+# ---------------------------------
+print("[INFO] Downloading HRS data from Google Drive...")
+file_id = "1ckrS7U_eZS8EWcB_1iIjlt8vnLdone0z"
+url = f"https://drive.google.com/uc?id={file_id}"
+output_path = "/content/randhrs1992_2020v2.sav"
+gdown.download(url, output_path, quiet=False)
+
+if not os.path.exists(output_path):
+    raise FileNotFoundError("Failed to download the file. Check the link and sharing settings.")
+
+# ---------------------------------
+# Step 3: Load .sav file
+# ---------------------------------
+import pyreadstat
+df, meta = pyreadstat.read_sav(output_path)
+
+# ---------------------------------
+# Step 4: Variable Selection and Codebook Verification
+# ---------------------------------
+# Wave 11 is the baseline, included as the first timestep
+baseline_wave = [col for col in df.columns if "R11" in col]
+assessment_waves = [col for col in df.columns if any(w in col for w in ["R12", "R13", "R14", "R15"])]
+alzheimers_cols = [col for col in assessment_waves if "ALZHES" in col]
+dental_cols = [col for col in df.columns if "DENTST" in col and (col in assessment_waves or "R11" in col)]
+cognitive_cols = [col for col in df.columns if "COGTOT" in col and any(w in col for w in ["R11", "R12", "R13"])]
+health_conditions = ["HIBPS", "DIABS", "CANCRS", "LUNGS", "HEARTS", "STROKS", "PSYCHS", "ARTHRS"]
+health_cols = [col for col in (baseline_wave + assessment_waves) if any(f"R{w}{cond}" in col for w in ["11", "12", "13", "14", "15"] for cond in health_conditions)]
+
+# Verify variable existence
+print("[INFO] Verifying variables...")
+available_cognitive = [col for col in cognitive_cols if col in df.columns]
+available_health = [col for col in health_cols if col in df.columns]
+available_dental = [col for col in dental_cols if col in df.columns]
+print(f"Available cognitive columns: {available_cognitive}")
+print(f"Available health columns: {available_health}")
+print(f"Available dental columns: {available_dental}")
+
+# Fallback if variables are missing
+if not available_cognitive or not available_health or not available_dental:
+    print("[WARNING] Some variables missing. Using alternative variables...")
+    alternative_cognitive = [col for col in df.columns if "COG" in col and any(w in col for w in ["R11", "R12", "R13"])]
+    alternative_health = [col for col in (baseline_wave + assessment_waves) if "HLTH" in col or "COND" in col]
+    alternative_dental = [col for col in (baseline_wave + assessment_waves) if "HLTH" in col]
+    cognitive_cols = [col for col in alternative_cognitive if col in df.columns][:1]
+    health_cols = [col for col in alternative_health if col in df.columns][:4]
+    dental_cols = [col for col in alternative_dental if col in df.columns][:1]
+    print(f"Fallback cognitive columns: {cognitive_cols}")
+    print(f"Fallback health columns: {health_cols}")
+    print(f"Fallback dental columns: {dental_cols}")
+
+selected_cols = alzheimers_cols + dental_cols + cognitive_cols + health_cols
+data = df[selected_cols].copy()
+
+# Feature engineering: Dental visit count
+data['dental_visit_count'] = data[dental_cols].sum(axis=1)
+selected_cols.append('dental_visit_count')
+
+# Document variables for codebook
+codebook = {
+    "Variable": [],
+    "Description": [],
+    "Wave": []
+}
+for col in selected_cols:
+    codebook["Variable"].append(col)
+    if col in meta.column_names:
+        codebook["Description"].append(meta.column_labels[meta.column_names.index(col)])
+    else:
+        desc = {
+            "ALZHES": "Alzheimer's disease diagnosis",
+            "DENTST": "Dental visit in past 2 years, indicator of oral health",
+            "COGTOT": "Total cognition summary score",
+            "HIBPS": "High blood pressure diagnosis",
+            "DIABS": "Diabetes diagnosis",
+            "CANCRS": "Cancer diagnosis",
+            "LUNGS": "Lung disease diagnosis",
+            "HEARTS": "Heart disease diagnosis",
+            "STROKS": "Stroke diagnosis",
+            "PSYCHS": "Psychiatric condition diagnosis",
+            "ARTHRS": "Arthritis diagnosis",
+            "dental_visit_count": "Total number of dental visits across waves 11–15, including baseline"
+        }.get(col.split("R")[1][2:] if col.startswith("R") else col, "Derived variable")
+        codebook["Description"].append(desc)
+    codebook["Wave"].append(col[:3] if col.startswith("R") else "All" if col == "dental_visit_count" else "Unknown")
+codebook_df = pd.DataFrame(codebook)
+codebook_df.to_csv("hrs_codebook.csv", index=False)
+print("[INFO] Codebook saved as hrs_codebook.csv")
+
+# Impute missing values
+imputer = SimpleImputer(strategy='mean')
+data[selected_cols] = imputer.fit_transform(data[selected_cols])
+
+# ---------------------------------
+# Step 5: Create Labels and Features
+# ---------------------------------
+label_col = alzheimers_cols[-1]
+data['target'] = (data[label_col] == 1).astype(int)
+X = data[[col for col in selected_cols if col != label_col]].values
+y = data['target'].values
+
+# Reshape X for sequential modeling
+n_features = X.shape[1]
+n_timesteps = 5
+if X.shape[1] % n_timesteps == 0:
+    X = X.reshape(X.shape[0], n_timesteps, -1)
+else:
+    X = X[:, :n_timesteps * (X.shape[1] // n_timesteps)].reshape(X.shape[0], n_timesteps, -1)
+
+# ---------------------------------
+# Step 6: Handle Imbalance and Scaling
+# ---------------------------------
+smote = SMOTE(sampling_strategy=0.5, random_state=42)
+X_resampled, y_resampled = smote.fit_resample(X.reshape(X.shape[0], -1), y)
+X_resampled = X_resampled.reshape(-1, n_timesteps, X.shape[2])
+
+# Ensure stratified splitting
+X_train, X_temp, y_train, y_temp = train_test_split(X_resampled, y_resampled, test_size=0.3, random_state=42, stratify=y_resampled)
+X_val, X_test, y_val, y_test = train_test_split(X_temp, y_temp, test_size=0.6667, random_state=42, stratify=y_temp)
+
+scaler = StandardScaler()
+X_train = scaler.fit_transform(X_train.reshape(X_train.shape[0], -1)).reshape(X_train.shape)
+X_val = scaler.transform(X_val.reshape(X_val.shape[0], -1)).reshape(X_val.shape)
+X_test = scaler.transform(X_test.reshape(X_test.shape[0], -1)).reshape(X_test.shape)
+
+# Convert to PyTorch tensors
+X_train_tensor = torch.tensor(X_train, dtype=torch.float32)
+X_val_tensor = torch.tensor(X_val, dtype=torch.float32)
+X_test_tensor = torch.tensor(X_test, dtype=torch.float32)
+y_train_tensor = torch.tensor(y_train, dtype=torch.float32).view(-1, 1)
+y_val_tensor = torch.tensor(y_val, dtype=torch.float32).view(-1, 1)
+y_test_tensor = torch.tensor(y_test, dtype=torch.float32).view(-1, 1)
+
+train_dataset = TensorDataset(X_train_tensor, y_train_tensor)
+val_dataset = TensorDataset(X_val_tensor, y_val_tensor)
+test_dataset = TensorDataset(X_test_tensor, y_test_tensor)
+
+train_loader = DataLoader(train_dataset, batch_size=64, shuffle=True, drop_last=True)
+val_loader = DataLoader(val_dataset, batch_size=64, shuffle=False, drop_last=False)
+test_loader = DataLoader(test_dataset, batch_size=64, shuffle=False, drop_last=False)
+
+# ---------------------------------
+# Step 7: Define Models
+# ---------------------------------
+class LSTMModel(nn.Module):
+    def __init__(self, input_size, hidden_size=64, num_layers=1):
+        super(LSTMModel, self).__init__()
+        self.lstm = nn.LSTM(input_size, hidden_size, num_layers=num_layers, batch_first=True, dropout=0.6)
+        self.fc = nn.Linear(hidden_size, 1)
+        self.sigmoid = nn.Sigmoid()
+
+    def forward(self, x):
+        _, (hn, _) = self.lstm(x)
+        out = self.fc(hn[-1])
+        return self.sigmoid(out)
+
+class TCNModel(nn.Module):
+    def __init__(self, input_size, num_channels=[32, 32], kernel_size=2, dropout=0.6):
+        super(TCNModel, self).__init__()
+        layers = []
+        for i in range(len(num_channels)):
+            dilation = 2 ** i
+            in_channels = input_size if i == 0 else num_channels[i-1]
+            out_channels = num_channels[i]
+            layers += [
+                nn.Conv1d(in_channels, out_channels, kernel_size, stride=1, padding=(kernel_size-1)*dilation, dilation=dilation),
+                nn.ReLU(),
+                nn.Dropout(dropout),
+            ]
+        self.tcn = nn.Sequential(*layers)
+        self.fc = nn.Linear(num_channels[-1], 1)
+        self.sigmoid = nn.Sigmoid()
+
+    def forward(self, x):
+        x = x.transpose(1, 2)
+        x = self.tcn(x)
+        x = x[:, :, -1]
+        out = self.fc(x)
+        return self.sigmoid(out)
+
+# ---------------------------------
+# Step 8: Training and Evaluation
+# ---------------------------------
+def train_model(model, train_loader, val_loader, epochs=50, model_name="model"):
+    criterion = nn.BCELoss()
+    optimizer = torch.optim.Adam(model.parameters(), lr=0.001, weight_decay=1e-4)
+    scheduler = ReduceLROnPlateau(optimizer, 'min', patience=5, factor=0.5)
+    best_f1 = 0
+    patience = 8
+    trigger_times = 0
+    train_losses, val_losses = [], []
+    train_accuracies, val_accuracies = [], []
+
+    for epoch in range(epochs):
+        model.train()
+        train_loss = 0
+        train_preds, train_labels = [], []
+        for xb, yb in train_loader:
+            preds = model(xb)
+            loss = criterion(preds, yb)
+            optimizer.zero_grad()
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            optimizer.step()
+            train_loss += loss.item()
+            train_preds.extend(preds.flatten().detach().cpu().numpy())  # Fixed
+            train_labels.extend(yb.flatten().detach().cpu().numpy())
+
+        train_loss /= len(train_loader)
+        train_accuracy = accuracy_score(train_labels, [1 if p >= 0.5 else 0 for p in train_preds])
+
+        model.eval()
+        val_loss = 0
+        val_preds, val_labels = [], []
+        with torch.no_grad():
+            for xb, yb in val_loader:
+                preds = model(xb)
+                val_loss += criterion(preds, yb).item()
+                val_preds.extend(preds.flatten().detach().cpu().numpy())  # Fixed
+                val_labels.extend(yb.flatten().detach().cpu().numpy())
+
+        val_loss /= len(val_loader)
+        val_metrics = evaluate_model(model, val_loader)
+        val_accuracy = accuracy_score(val_labels, [1 if p >= val_metrics['threshold'] else 0 for p in val_preds])
+
+        train_losses.append(train_loss)
+        val_losses.append(val_loss)
+        train_accuracies.append(train_accuracy)
+        val_accuracies.append(val_accuracy)
+
+        scheduler.step(val_metrics['f1'])
+
+        if val_metrics['f1'] > best_f1:
+            best_f1 = val_metrics['f1']
+            trigger_times = 0
+            torch.save(model.state_dict(), f'best_{model_name}.pt')
+        else:
+            trigger_times += 1
+            if trigger_times >= patience:
+                print(f"Early stopping at epoch {epoch+1}")
+                break
+
+        print(f"Epoch {epoch+1}/{epochs}, Train Loss: {train_loss:.4f}, Train Accuracy: {train_accuracy:.4f}, "
+              f"Val Loss: {val_loss:.4f}, Val Accuracy: {val_accuracy:.4f}, Val F1: {val_metrics['f1']:.4f}")
+
+    model.load_state_dict(torch.load(f'best_{model_name}.pt'))
+
+    plt.figure(figsize=(12, 5))
+    plt.subplot(1, 2, 1)
+    plt.plot(train_losses, label='Train Loss')
+    plt.plot(val_losses, label='Val Loss')
+    plt.xlabel('Epoch')
+    plt.ylabel('Loss')
+    plt.title(f'{model_name} Loss Curves')
+    plt.legend()
+
+    plt.subplot(1, 2, 2)
+    plt.plot(train_accuracies, label='Train Accuracy')
+    plt.plot(val_accuracies, label='Val Accuracy')
+    plt.xlabel('Epoch')
+    plt.ylabel('Accuracy')
+    plt.title(f'{model_name} Accuracy Curves')
+    plt.legend()
+
+    plt.tight_layout()
+    plt.savefig(f'{model_name}_learning_curves.png')
+    plt.close()
+
+    return model, {'train_losses': train_losses, 'val_losses': val_losses,
+                  'train_accuracies': train_accuracies, 'val_accuracies': val_accuracies}
+
+def evaluate_model(model, loader, threshold=0.5):
+    model.eval()
+    all_preds, all_labels, binary_preds = [], [], []
+    with torch.no_grad():
+        for xb, yb in loader:
+            preds = model(xb)
+            all_preds.extend(preds.flatten().detach().cpu().numpy())
+            all_labels.extend(yb.flatten().detach().cpu().numpy())
+
+    thresholds = np.arange(0.1, 0.9, 0.05)
+    f1_scores = [f1_score(all_labels, [1 if p >= t else 0 for p in all_preds]) for t in thresholds]
+    optimal_threshold = thresholds[np.argmax(f1_scores)]
+
+    binary_preds = [1 if p >= optimal_threshold else 0 for p in all_preds]
+    return {
+        'accuracy': accuracy_score(all_labels, binary_preds),
+        'precision': precision_score(all_labels, binary_preds, zero_division=0),
+        'recall': recall_score(all_labels, binary_preds, zero_division=0),
+        'f1': f1_score(all_labels, binary_preds, zero_division=0),
+        'auc': roc_auc_score(all_labels, all_preds),
+        'conf_matrix': confusion_matrix(all_labels, binary_preds),
+        'threshold': optimal_threshold,
+        'binary_preds': binary_preds
+    }
+
+# ---------------------------------
+# Step 9: Cross-Validation and Final Evaluation
+# ---------------------------------
+skf = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
+lstm_val_f1s, tcn_val_f1s = [], []
+
+for fold, (train_idx, val_idx) in enumerate(skf.split(X_resampled, y_resampled)):
+    print(f"\n[INFO] Fold {fold+1}/5")
+    X_train = X_resampled[train_idx]
+    y_train = y_resampled[train_idx]
+    X_val = X_resampled[val_idx]
+    y_val = y_resampled[val_idx]
+
+    scaler = StandardScaler()
+    X_train = scaler.fit_transform(X_train.reshape(X_train.shape[0], -1)).reshape(X_train.shape)
+    X_val = scaler.transform(X_val.reshape(X_val.shape[0], -1)).reshape(X_val.shape)
+
+    train_dataset = TensorDataset(torch.tensor(X_train, dtype=torch.float32),
+                                 torch.tensor(y_train, dtype=torch.float32).view(-1, 1))
+    val_dataset = TensorDataset(torch.tensor(X_val, dtype=torch.float32),
+                               torch.tensor(y_val, dtype=torch.float32).view(-1, 1))
+
+    train_loader = DataLoader(train_dataset, batch_size=64, shuffle=True, drop_last=True)
+    val_loader = DataLoader(val_dataset, batch_size=64, shuffle=False, drop_last=False)
+
+    input_size = X_train.shape[2]
+    lstm_model = LSTMModel(input_size)
+    tcn_model = TCNModel(input_size)
+
+    print(f"[INFO] Training LSTM Model for Fold {fold+1}...")
+    lstm_model, lstm_history = train_model(lstm_model, train_loader, val_loader, model_name=f"LSTM_fold{fold+1}")
+
+    print(f"[INFO] Training TCN Model for Fold {fold+1}...")
+    tcn_model, tcn_history = train_model(tcn_model, train_loader, val_loader, model_name=f"TCN_fold{fold+1}")
+
+    lstm_val_metrics = evaluate_model(lstm_model, val_loader)
+    tcn_val_metrics = evaluate_model(tcn_model, val_loader)
+
+    lstm_val_f1s.append(lstm_val_metrics['f1'])
+    tcn_val_f1s.append(tcn_val_metrics['f1'])
+
+    print(f"Fold {fold+1} - LSTM Val F1: {lstm_val_metrics['f1']:.4f}, TCN Val F1: {tcn_val_metrics['f1']:.4f}")
+
+print(f"\n[SUMMARY] Cross-Validation Results:")
+print(f"LSTM Avg Val F1: {np.mean(lstm_val_f1s):.4f} ± {np.std(lstm_val_f1s):.4f}")
+print(f"TCN Avg Val F1: {np.mean(tcn_val_f1s):.4f} ± {np.std(tcn_val_f1s):.4f}")
+
+# Final evaluation on test set
+input_size = X_train_tensor.shape[2]
+lstm_model = LSTMModel(input_size)
+tcn_model = TCNModel(input_size)
+
+print("\n[INFO] Training LSTM Model for Final Evaluation...")
+lstm_model, lstm_history = train_model(lstm_model, train_loader, val_loader, model_name="LSTM_final")
+
+print("\n[INFO] Training TCN Model for Final Evaluation...")
+tcn_model, tcn_history = train_model(tcn_model, train_loader, val_loader, model_name="TCN_final")
+
+print("\n[INFO] Evaluating LSTM Model")
+lstm_val_metrics = evaluate_model(lstm_model, val_loader)
+lstm_test_metrics = evaluate_model(lstm_model, test_loader)
+print("LSTM Validation Metrics:")
+for k, v in lstm_val_metrics.items():
+    if k != 'binary_preds':
+        print(f"{k}: {v}")
+print("\nLSTM Test Metrics:")
+for k, v in lstm_test_metrics.items():
+    if k != 'binary_preds':
+        print(f"{k}: {v}")
+
+print("\n[INFO] Evaluating TCN Model")
+tcn_val_metrics = evaluate_model(tcn_model, val_loader)
+tcn_test_metrics = evaluate_model(tcn_model, test_loader)
+print("TCN Validation Metrics:")
+for k, v in tcn_val_metrics.items():
+    if k != 'binary_preds':
+        print(f"{k}: {v}")
+print("\nTCN Test Metrics:")
+for k, v in tcn_test_metrics.items():
+    if k != 'binary_preds':
+        print(f"{k}: {v}")
+
+# Check for overfitting
+val_test_f1_gap = abs(lstm_val_metrics['f1'] - lstm_test_metrics['f1'])
+if val_test_f1_gap > 0.05:
+    print(f"[WARNING] Potential overfitting detected: LSTM Val F1 ({lstm_val_metrics['f1']:.4f}) "
+          f"vs Test F1 ({lstm_test_metrics['f1']:.4f}) differs by {val_test_f1_gap:.4f}")
+else:
+    print(f"[INFO] No significant overfitting: LSTM Val F1 ({lstm_val_metrics['f1']:.4f}) "
+          f"vs Test F1 ({lstm_test_metrics['f1']:.4f})")
+
+val_test_f1_gap = abs(tcn_val_metrics['f1'] - tcn_test_metrics['f1'])
+if val_test_f1_gap > 0.05:
+    print(f"[WARNING] Potential overfitting detected: TCN Val F1 ({tcn_val_metrics['f1']:.4f}) "
+          f"vs Test F1 ({tcn_test_metrics['f1']:.4f}) differs by {val_test_f1_gap:.4f}")
+else:
+    print(f"[INFO] No significant overfitting: TCN Val F1 ({tcn_val_metrics['f1']:.4f}) "
+          f"vs Test F1 ({tcn_test_metrics['f1']:.4f})")
+
+print("\n[SUMMARY] Model Comparison (Validation):")
+for metric in ['accuracy', 'precision', 'recall', 'f1', 'auc']:
+    print(f"{metric.capitalize()}: LSTM = {lstm_val_metrics[metric]:.4f}, TCN = {tcn_val_metrics[metric]:.4f}")
+
+print("\n[SUMMARY] Model Comparison (Test):")
+for metric in ['accuracy', 'precision', 'recall', 'f1', 'auc']:
+    print(f"{metric.capitalize()}: LSTM = {lstm_test_metrics[metric]:.4f}, TCN = {tcn_test_metrics[metric]:.4f}")
+
+# McNemar's Test
+print("\n[INFO] Performing McNemar's Test on Test Set Predictions...")
+lstm_preds = lstm_test_metrics['binary_preds']
+tcn_preds = tcn_test_metrics['binary_preds']
+y_test_labels = y_test_tensor.flatten().cpu().numpy()
+
+contingency = np.zeros((2, 2))
+for l, t, y in zip(lstm_preds, tcn_preds, y_test_labels):
+    l_correct = l == y
+    t_correct = t == y
+    contingency[int(l_correct), int(t_correct)] += 1
+
+mcnemar_result = ct.mcnemar(contingency, exact=False, correction=True)
+print(f"McNemar's Test: Statistic = {mcnemar_result.statistic:.4f}, p-value = {mcnemar_result.pvalue:.4f}")
+if mcnemar_result.pvalue < 0.05:
+    print("Significant difference between LSTM and TCN (p < 0.05)")
+else:
+    print("No significant difference between LSTM and TCN (p >= 0.05)")
